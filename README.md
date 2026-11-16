@@ -1,53 +1,41 @@
 # PrintMaster
 
-PrintMaster is a small serverless backend for managing **3D printer filament**. It keeps an
-inventory of filament spools (name, colour, material, initial weight and remaining weight) and
-tracks how much filament is left on each spool as prints consume it.
+PrintMaster — це невеликий серверлес-бекенд для обліку **філаменту для 3D-принтера**. Він
+зберігає перелік котушок (назва, колір, матеріал, початкова і залишкова вага) і відстежує, скільки
+пластику залишилося на кожній котушці.
 
-The app is **API-only**. There is no UI: a 3D printer, its host software or any HTTP client talks
-to it over **HTTPS** through a JSON REST API. A typical setup registers spools once, then has the
-printer (or a post-print script on its controller) report each job's filament usage. The API
-subtracts that usage from the spool atomically and rejects requests that would take a spool below
-zero.
+Застосунок працює **лише як API**, без інтерфейсу користувача. Принтер, його керуюче програмне
+забезпечення або будь-який HTTP-клієнт звертається до нього через **HTTPS**. Котушки достатньо
+зареєструвати один раз. Після кожного друку принтер надсилає, скільки філаменту витрачено, і
+PrintMaster віднімає цю кількість від залишку на котушці.
 
-- **Runtime:** TypeScript on Node.js 22 (ESM), running on AWS Lambda
-- **Storage:** Amazon DynamoDB
-- **Infrastructure as code:** AWS CDK (TypeScript)
-- **Tooling:** pnpm workspace, esbuild, vitest, ESLint, Prettier
+**Технології:** TypeScript, Node.js 22, AWS Lambda, Amazon DynamoDB, AWS CDK, pnpm.
 
 ---
 
-## Contents
+## Зміст
 
 - [API](#api)
-- [Architecture](#architecture)
-  - [Workspace layout](#workspace-layout)
-  - [Package design](#package-design)
-  - [Request flow](#request-flow)
-  - [Data model](#data-model)
-- [AWS infrastructure](#aws-infrastructure)
-  - [AWS services](#aws-services)
-  - [Stacks](#stacks)
-- [Deployment guide](#deployment-guide)
-- [Development](#development)
+- [Архітектура](#архітектура)
+  - [AWS-інфраструктура](#aws-інфраструктура)
+  - [Структура коду](#структура-коду)
+- [Розгортання](#розгортання)
+- [Розробка](#розробка)
 
 ---
 
 ## API
 
-All endpoints accept and return JSON. Successful responses wrap their payload in `data`. Errors
-use one shape: `{ "error": { "code": "...", "message": "..." } }`.
+| Метод    | Шлях                           | Опис                          |
+| -------- | ------------------------------ | ----------------------------- |
+| `GET`    | `/spools`                      | Список усіх котушок           |
+| `GET`    | `/spools/{id}`                 | Одна котушка                  |
+| `POST`   | `/spools`                      | Додати нову котушку           |
+| `DELETE` | `/spools/{id}`                 | Видалити котушку              |
+| `POST`   | `/spools/{id}/subtract-weight` | Списати витрачений філамент   |
+| `GET`    | `/hello`                       | Перевірка з'єднання           |
 
-| Method   | Path                          | Description                        | Success |
-| -------- | ----------------------------- | ---------------------------------- | ------- |
-| `GET`    | `/spools`                     | List all spools                    | `200`   |
-| `GET`    | `/spools/{id}`                | Get one spool                      | `200`   |
-| `POST`   | `/spools`                     | Register a new spool               | `201`   |
-| `DELETE` | `/spools/{id}`                | Remove a spool                     | `204`   |
-| `POST`   | `/spools/{id}/subtract-weight` | Record filament used by a print    | `200`   |
-| `GET`    | `/hello`                      | Connectivity check (returns spools) | `200`   |
-
-**Spool**
+Приклад котушки:
 
 ```json
 {
@@ -60,288 +48,126 @@ use one shape: `{ "error": { "code": "...", "message": "..." } }`.
 }
 ```
 
-`material` is one of `PLA`, `ABS` or `PETG`. Weights are in grams. `initialWeight` is fixed when
-the spool is created. `weight` is the amount remaining.
-
-**Create a spool:** `POST /spools`
-
-```json
-{ "name": "Galaxy Black", "color": "Black", "material": "PETG", "initialWeight": 1000 }
-```
-
-**Record usage:** `POST /spools/{id}/subtract-weight`
-
-```json
-{ "amount": 23.5 }
-```
-
-**Error codes**
-
-| HTTP  | Code                    | When                                                        |
-| ----- | ----------------------- | ----------------------------------------------------------- |
-| `400` | `BAD_REQUEST`           | Missing or malformed JSON body, missing path parameter      |
-| `400` | `INVALID_SPOOL_DATA`    | Validation failed (empty name, unknown material, weight ≤ 0) |
-| `404` | `SPOOL_NOT_FOUND`       | No spool with that id                                       |
-| `409` | `INSUFFICIENT_FILAMENT` | The spool has less filament left than the requested amount  |
-| `500` | `INTERNAL_ERROR`        | Unexpected failure                                          |
+Матеріал може бути `PLA`, `ABS` або `PETG`. Вага вказується в грамах. Якщо на котушці залишилося
+менше філаменту, ніж потрібно списати, API відхиляє запит і не змінює залишок.
 
 ---
 
-## Architecture
+## Архітектура
 
-### Workspace layout
+### AWS-інфраструктура
 
-Everything lives in `backend/`, a single **pnpm workspace** with three kinds of members:
-
-```
-backend/
-├── packages/                 # Reusable libraries, shipped as raw TypeScript (no build step)
-│   ├── shared/               # @printmaster/shared              – ApplicationError base class
-│   ├── dynamodb/             # @printmaster/dynamodb            – DynamoDB client, pagination, table schema type
-│   ├── filament-management/  # @printmaster/filament-management – domain logic + DynamoDB adapter
-│   └── api-utils/            # @printmaster/api-utils           – HTTP helpers and error → status mapping
-├── lambdas/                  # One deployable Lambda handler per API route
-│   ├── list-spools/
-│   ├── get-spool/
-│   ├── create-spool/
-│   ├── delete-spool/
-│   ├── subtract-weight/
-│   └── my-lambda/            # GET /hello
-└── infra/                    # AWS CDK app: DataStack + ApiStack
-```
-
-### Package design
-
-The code follows a **ports-and-adapters** (hexagonal) layout. Dependencies point inward: the
-Lambdas know about HTTP, the domain package knows about spools, and storage sits behind an
-interface.
-
-```mermaid
-flowchart TD
-    subgraph lambdas["lambdas/* — thin HTTP adapters"]
-        L1[list-spools]
-        L2[get-spool]
-        L3[create-spool]
-        L4[delete-spool]
-        L5[subtract-weight]
-        L6[my-lambda]
-    end
-
-    API["@printmaster/api-utils<br/>JSON parsing, responses,<br/>error → HTTP status"]
-
-    subgraph FM["@printmaster/filament-management"]
-        SVC["FilamentManagementService<br/>validation + business rules"]
-        PORT[["FilamentSpoolRepository<br/>(interface)"]]
-        DDBREPO["DynamoDbFilamentSpoolRepository"]
-        MEM["InMemoryFilamentSpoolRepository<br/>(tests)"]
-        TBL["persistence/tables.ts<br/>TableDefinition"]
-        SVC --> PORT
-        DDBREPO -. implements .-> PORT
-        MEM -. implements .-> PORT
-    end
-
-    DDB["@printmaster/dynamodb<br/>DocumentClient singleton, requireEnv,<br/>queryAll / queryPage, TableDefinition type"]
-    SH["@printmaster/shared<br/>ApplicationError"]
-    INFRA["infra (AWS CDK)"]
-
-    lambdas --> API
-    lambdas --> SVC
-    API --> FM
-    API --> SH
-    DDBREPO --> DDB
-    FM --> SH
-    DDB --> SH
-    INFRA -- "imports ./tables" --> TBL
-    INFRA -- "imports ./schema (types)" --> DDB
-```
-
-What each layer is responsible for:
-
-- **`@printmaster/shared`** holds `ApplicationError`. Every custom error in the codebase extends it
-  and carries a stable `code` string, which is what ends up in API error responses.
-- **`@printmaster/dynamodb`** is the generic DynamoDB toolkit. It provides a module-level
-  `DynamoDBDocumentClient` singleton (reused across warm Lambda invocations), `requireEnv()` for
-  table names, cursor pagination helpers, `isConditionalCheckFailed()`, and the framework-neutral
-  `TableDefinition` type.
-- **`@printmaster/filament-management`** is the domain. `FilamentManagementService` validates
-  input and applies the business rules. It depends only on the `FilamentSpoolRepository`
-  interface. The DynamoDB adapter implements that interface with **intent-level operations**
-  (`create`, `subtractWeight`, `deleteById`) rather than a generic `save`. This lets each write
-  run as a single atomic, conditional DynamoDB request. The package also **owns its table
-  definition** (`./tables` subpath), so infra and runtime code share one source of truth for key
-  names and the table-name environment variable.
-- **`@printmaster/api-utils`** turns API Gateway events into domain calls and domain results into
-  HTTP responses. `withErrorHandling()` maps each error class to an HTTP status code.
-- **`lambdas/*`**: each Lambda is a few lines long. It builds the service once at module scope
-  with `createFilamentManagementService()`, then parses the request, calls the service and returns
-  JSON.
-- **`infra`** turns the domain's `TableDefinition` into a real DynamoDB table and wires each
-  Lambda to API Gateway with least-privilege access.
-
-All library packages export **raw TypeScript** (`"exports": "./src/index.ts"`). Nothing is
-prebuilt. At deploy time, esbuild bundles each Lambda together with the workspace packages it uses
-into a single ESM file. The AWS SDK v3 is left external because the Lambda runtime provides it.
-
-### Request flow
-
-Here is what happens when a printer reports filament usage:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant P as 3D printer / client
-    participant G as API Gateway (HTTP API)
-    participant L as Lambda: subtract-weight
-    participant S as FilamentManagementService
-    participant R as DynamoDbFilamentSpoolRepository
-    participant D as DynamoDB
-
-    P->>G: POST /spools/{id}/subtract-weight<br/>{ "amount": 23.5 } over HTTPS
-    G->>L: Invoke (payload format 2.0)
-    L->>S: subtractWeight(id, 23.5)
-    S->>S: validate amount > 0
-    S->>R: subtractWeight(id, 23.5)
-    R->>D: UpdateItem SET weight = weight - :amount<br/>IF attribute_exists(PK) AND weight >= :amount
-    alt condition holds
-        D-->>R: updated item (ALL_NEW)
-        R-->>L: FilamentSpool
-        L-->>G: 200 { data: spool }
-    else condition fails
-        R->>D: GetItem (to tell which condition failed)
-        R-->>L: SpoolNotFoundError / InsufficientFilamentError
-        L-->>G: 404 SPOOL_NOT_FOUND / 409 INSUFFICIENT_FILAMENT
-    end
-    G-->>P: JSON response
-```
-
-The check and the write happen in **one conditional `UpdateItem`**, so concurrent prints that
-report usage against the same spool can't lose updates or drive the weight negative.
-
-### Data model
-
-Spools live in one DynamoDB table that follows **single-table design** with generic keys:
-
-| Attribute    | Value                | Notes                                          |
-| ------------ | -------------------- | ---------------------------------------------- |
-| `PK`         | `SPOOLS`             | Partition key. All spools share one partition. |
-| `SK`         | `SPOOL#<id>`         | Sort key, prefixed with the entity type        |
-| `entityType` | `Spool`              | Identifies the item type                       |
-| …            | spool fields         | `id`, `name`, `color`, `material`, `initialWeight`, `weight` |
-
-| Access pattern       | DynamoDB operation                                    |
-| -------------------- | ----------------------------------------------------- |
-| List all spools      | `Query` on `PK = SPOOLS` (paginated, no `Scan`)       |
-| Get spool by id      | `GetItem` on the full key                             |
-| Create spool         | `PutItem` with `attribute_not_exists(PK)`             |
-| Subtract weight      | `UpdateItem` with `weight >= :amount` condition       |
-| Delete spool         | `DeleteItem` with `ReturnValues: ALL_OLD`             |
-
-The mapping between domain objects and stored items (`toSpoolItem` / `fromSpoolItem`) lives in
-`src/persistence/spool.item.ts`, so the domain types contain no storage attributes. For a full
-walkthrough, see
-[`backend/packages/filament-management/DYNAMODB.md`](backend/packages/filament-management/DYNAMODB.md).
-
----
-
-## AWS infrastructure
-
-The whole backend is **serverless and pay-per-use**: there are no servers, containers or VPCs to
-manage, and an idle deployment costs close to nothing. The infrastructure is defined in TypeScript
-with the **AWS CDK** (`backend/infra`) and deployed as two **AWS CloudFormation** stacks.
+Бекенд повністю **серверлесний**: немає серверів чи контейнерів, якими треба керувати, а оплата
+залежить лише від кількості запитів. Інфраструктуру описано кодом за допомогою **AWS CDK**
+(`backend/infra`) і розгорнуто як два стеки **AWS CloudFormation**.
 
 ```mermaid
 flowchart LR
-    client["3D printer /<br/>HTTP client"]
+    client["3D-принтер /<br/>HTTP-клієнт"]
 
-    subgraph aws["AWS account · region"]
+    subgraph aws["Акаунт AWS"]
         direction LR
 
-        subgraph apiStack["CloudFormation stack: PrintMaster-Api-Dev"]
+        subgraph apiStack["Стек PrintMaster-Api-Dev"]
             direction TB
-            apigw["Amazon API Gateway<br/>HTTP API · printmaster-api<br/>HTTPS endpoint"]
+            apigw["Amazon API Gateway<br/>HTTP API (HTTPS)"]
 
-            subgraph fns["AWS Lambda · Node.js 22 · arm64 (Graviton) · 256 MB · 10 s"]
+            subgraph fns["AWS Lambda · Node.js 22 · arm64"]
                 direction TB
-                f1["ListSpools<br/>GET /spools"]
-                f2["GetSpool<br/>GET /spools/{id}"]
-                f3["CreateSpool<br/>POST /spools"]
-                f4["DeleteSpool<br/>DELETE /spools/{id}"]
-                f5["SubtractSpoolWeight<br/>POST /spools/{id}/subtract-weight"]
-                f6["Hello<br/>GET /hello"]
+                f1["ListSpools"]
+                f2["GetSpool"]
+                f3["CreateSpool"]
+                f4["DeleteSpool"]
+                f5["SubtractSpoolWeight"]
+                f6["Hello"]
             end
 
-            iam["AWS IAM<br/>one execution role per function"]
-            cw["Amazon CloudWatch Logs<br/>one log group per function<br/>5-day retention"]
+            iam["AWS IAM<br/>ролі з мінімальними правами"]
+            cw["Amazon CloudWatch Logs<br/>логи функцій"]
         end
 
-        subgraph dataStack["CloudFormation stack: PrintMaster-Data-Dev"]
-            ddb[("Amazon DynamoDB<br/>FilamentSpoolsTable<br/>PK / SK · on-demand billing")]
+        subgraph dataStack["Стек PrintMaster-Data-Dev"]
+            ddb[("Amazon DynamoDB<br/>таблиця котушок")]
         end
     end
 
     client -- HTTPS --> apigw
-    apigw -- "Lambda proxy integration" --> fns
-    fns -- "read: List / Get / Hello<br/>read-write: Create / Delete / Subtract" --> ddb
-    fns -- logs --> cw
-    iam -. "assumed by" .-> fns
-    apiStack -. "table name via weak<br/>cross-stack reference" .-> dataStack
+    apigw --> fns
+    fns -- "читання / запис" --> ddb
+    fns -- логи --> cw
+    iam -. "права доступу" .-> fns
 ```
 
-### AWS services
+#### Сервіси AWS
 
-| Service                    | What it does in PrintMaster                                                                                                                                                                                                                                                          |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Amazon API Gateway**     | An **HTTP API** (API Gateway v2) named `printmaster-api` is the public entry point. It terminates **TLS** on its `https://<api-id>.execute-api.<region>.amazonaws.com` endpoint and routes each method and path to its Lambda through a proxy integration (payload format 2.0).                |
-| **AWS Lambda**             | Six functions, one per route. Each runs **Node.js 22** on **arm64 (AWS Graviton)** with 256 MB of memory and a 10 s timeout. Code is bundled as ESM with source maps (`NODE_OPTIONS=--enable-source-maps`). The AWS SDK v3 comes from the Lambda runtime.                                         |
-| **Amazon DynamoDB**        | One table, `FilamentSpoolsTable`, with a string `PK`/`SK` key and **on-demand (pay-per-request) billing**. CloudFormation generates the table name, and each Lambda receives it through the `FILAMENT_SPOOLS_TABLE_NAME` environment variable.                                               |
-| **AWS IAM**                | Each function gets its own execution role. CDK grants **least-privilege** table access per route: read-only functions get `grantReadData`, and mutating functions get `grantReadWriteData`. The roles also include basic CloudWatch Logs write permissions.                                  |
-| **Amazon CloudWatch Logs** | Each function has an explicitly created log group with **5-day retention**, so logs don't pile up indefinitely. The log groups are removed together with the stack.                                                                                                                          |
-| **AWS CloudFormation**     | The two stacks, `PrintMaster-Data-Dev` and `PrintMaster-Api-Dev`, are CloudFormation stacks. The API stack reads the table name from the data stack through a **weak cross-stack reference** (`Fn::GetStackOutput`) rather than an `Export`/`ImportValue` pair, so the stacks stay loosely coupled. |
-| **Amazon S3**              | The CDK bootstrap bucket (`cdk-*-assets-*`) stores the bundled Lambda code and the synthesized templates during deployment.                                                                                                                                                                  |
-| **AWS Systems Manager**    | The CDK bootstrap stack (`CDKToolkit`) records its version in an SSM Parameter Store parameter, which `cdk deploy` checks.                                                                                                                                                                   |
+| Сервіс                     | Роль у PrintMaster                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Amazon API Gateway**     | HTTP API — публічна точка входу. Приймає запити через HTTPS і передає кожен маршрут відповідній Lambda-функції.                             |
+| **AWS Lambda**             | Шість функцій, по одній на кожен маршрут. Працюють на Node.js 22 і процесорах AWS Graviton (arm64), які дешевші за x86.                      |
+| **Amazon DynamoDB**        | Одна таблиця для котушок з оплатою за запити (on-demand). Списання ваги виконується одним атомарним запитом, тож паралельні друки не конфліктують. |
+| **AWS IAM**                | Кожна функція має власну роль. Функції, які лише читають дані, не мають права на запис.                                                     |
+| **Amazon CloudWatch Logs** | Логи кожної функції. Вони зберігаються 5 днів, тому не накопичуються і не збільшують витрати.                                               |
+| **AWS CloudFormation**     | Керує двома стеками: окремо для даних і окремо для API.                                                                                     |
+| **Amazon S3**              | Під час розгортання CDK завантажує сюди зібраний код функцій.                                                                               |
+| **AWS Systems Manager**    | Зберігає службовий параметр CDK (версію bootstrap-стека).                                                                                   |
 
-All resources are tagged `project=printmaster` and `env=dev`.
+#### Стеки
 
-### Stacks
+Інфраструктуру розділено на два стеки за життєвим циклом:
 
-The infrastructure is split by **lifecycle**:
+- **`PrintMaster-Data-Dev`** містить дані, тобто таблицю DynamoDB. Цей стек змінюється рідко.
+- **`PrintMaster-Api-Dev`** містить API, Lambda-функції, ролі та логи. Він не зберігає даних, тож
+  його можна будь-коли перестворити, не втративши жодної котушки.
 
-- **`PrintMaster-Data-Dev`** (`lib/data-stack.ts`) holds stateful resources only: the DynamoDB
-  table. It is built from the domain package's `TableDefinition` by `lib/tables.ts`, so the CDK
-  table always matches the keys the runtime code expects. The table's construct id
-  (`FilamentSpoolsTable`) is permanent and pinned by a test, because changing it would replace the
-  table.
-- **`PrintMaster-Api-Dev`** (`lib/api-stack.ts`) holds stateless resources: the HTTP API, the
-  Lambda functions, their roles and their log groups. It receives the table through props and
-  outputs `ApiUrl`. Because it holds no data, it can be destroyed and recreated at any time.
+### Структура коду
+
+Увесь код розміщено в `backend/` — це один pnpm-воркспейс із трьома частинами:
+
+- **`packages/`** — спільні бібліотеки:
+  - `filament-management` — бізнес-логіка: робота з котушками та їх збереження в DynamoDB;
+  - `dynamodb` — спільне підключення до DynamoDB;
+  - `api-utils` — обробка HTTP-запитів і помилок;
+  - `shared` — базовий клас помилок.
+- **`lambdas/`** — окрема Lambda-функція для кожного маршруту API. Кожна з них лише приймає
+  запит, викликає бізнес-логіку і повертає JSON.
+- **`infra/`** — опис AWS-інфраструктури на CDK.
 
 ```mermaid
-flowchart LR
-    dev["Developer<br/>pnpm run deploy"] --> synth["cdk synth<br/>esbuild bundles each Lambda<br/>(local, no Docker needed)"]
-    synth --> s3["Amazon S3<br/>CDK assets bucket"]
-    synth --> cfn["AWS CloudFormation"]
-    s3 --> cfn
-    cfn --> data["PrintMaster-Data-Dev<br/>DynamoDB table"]
-    cfn --> apiS["PrintMaster-Api-Dev<br/>API Gateway · Lambda · IAM · CloudWatch Logs"]
-    data -. "table name" .-> apiS
+flowchart TD
+    L["lambdas/*<br/>обробники маршрутів"]
+    API["api-utils<br/>HTTP-запити та помилки"]
+    FM["filament-management<br/>бізнес-логіка котушок"]
+    DDB["dynamodb<br/>підключення до БД"]
+    SH["shared<br/>базові помилки"]
+    INFRA["infra<br/>AWS CDK"]
+
+    L --> API
+    L --> FM
+    API --> FM
+    FM --> DDB
+    FM --> SH
+    API --> SH
+    DDB --> SH
+    INFRA -- "опис таблиці" --> FM
 ```
+
+Бізнес-логіка не залежить від HTTP і від конкретної бази даних. Таблицю DynamoDB описано лише в
+одному місці, у пакеті `filament-management`, і цей опис використовують як інфраструктура, так і
+код. Під час розгортання кожна функція разом із потрібними їй пакетами збирається в один файл.
 
 ---
 
-## Deployment guide
+## Розгортання
 
-### 1. Prerequisites
+### 1. Що потрібно
 
-- **Node.js 22**. The version is pinned in `backend/.nvmrc`, so run `nvm use` inside `backend/`.
-- **pnpm**. Any recent global pnpm works: the workspace pins `pnpm@12.18.0`, and pnpm switches to
-  that version automatically. Without a global pnpm, run `corepack enable`.
-- **AWS CLI v2** with credentials for the target account.
-- An IAM identity that is allowed to deploy CloudFormation stacks. CDK deploys through the roles
-  that the bootstrap stack creates.
+- **Node.js 22** (версію вказано в `backend/.nvmrc`)
+- **pnpm** (потрібна версія підтягується автоматично)
+- **AWS CLI** з доступом до акаунту AWS
 
-Docker is **not** required. Lambda bundling uses the esbuild binary installed in the workspace.
+Docker не потрібен.
 
-### 2. Install dependencies
+### 2. Встановлення залежностей
 
 ```bash
 cd backend
@@ -349,141 +175,80 @@ nvm use
 pnpm install
 ```
 
-### 3. Configure AWS credentials and region
-
-CDK takes the account and region from your active AWS credentials (`CDK_DEFAULT_ACCOUNT` /
-`CDK_DEFAULT_REGION`). Choose a profile and region:
+### 3. Налаштування доступу до AWS
 
 ```bash
-# Option A: IAM Identity Center (SSO)
-aws configure sso --profile printmaster
-aws sso login --profile printmaster
-
-# Option B: access keys
-aws configure --profile printmaster
-
+aws configure --profile printmaster      # або: aws configure sso --profile printmaster
 export AWS_PROFILE=printmaster
-export AWS_REGION=eu-central-1   # any region you like
+export AWS_REGION=eu-central-1           # будь-який регіон
 
-aws sts get-caller-identity       # confirm the account you are about to deploy to
+aws sts get-caller-identity              # перевірте, в який акаунт буде розгортання
 ```
 
-### 4. Bootstrap CDK (once per account and region)
-
-Bootstrapping creates the `CDKToolkit` stack: the S3 assets bucket, the deployment IAM roles and
-the SSM version parameter.
+### 4. Підготовка CDK (один раз для акаунту та регіону)
 
 ```bash
 cd infra
 pnpm exec cdk bootstrap
 ```
 
-### 5. Verify
-
-Run the type check, the infra tests and a full synth before deploying:
+### 5. Перевірка та розгортання
 
 ```bash
-pnpm verify
+pnpm verify          # перевірка типів, тести і збірка шаблонів
+pnpm diff            # (необов'язково) що саме зміниться в AWS
+pnpm run deploy      # розгортання обох стеків
 ```
 
-Optionally, review the change set against what is already deployed:
+> Використовуйте саме `pnpm run deploy`, а не `pnpm deploy`: `deploy` — це вбудована команда
+> pnpm, і вона має пріоритет над скриптом.
 
-```bash
-pnpm diff
-```
-
-### 6. Deploy
-
-```bash
-pnpm run deploy
-```
-
-> Use `pnpm run deploy`, **not** `pnpm deploy`. `deploy` is a built-in pnpm command, and the
-> built-in takes precedence over the script.
-
-This deploys both stacks (`cdk deploy --all`). CDK orders them automatically: the data stack
-deploys first, then the API stack. CDK asks for confirmation before creating IAM resources.
-
-When the deploy finishes, CDK prints the API URL:
+Після розгортання CDK виведе адресу API:
 
 ```
-Outputs:
 PrintMaster-Api-Dev.ApiUrl = https://abc123xyz.execute-api.eu-central-1.amazonaws.com
 ```
 
-You can read it again later with:
-
-```bash
-aws cloudformation describe-stacks --stack-name PrintMaster-Api-Dev \
-  --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text
-```
-
-### 7. Smoke test
+### 6. Перевірка роботи
 
 ```bash
 API=https://abc123xyz.execute-api.eu-central-1.amazonaws.com
 
-# Register a spool
 curl -s -X POST "$API/spools" -H 'Content-Type: application/json' \
   -d '{"name":"Galaxy Black","color":"Black","material":"PETG","initialWeight":1000}'
 
-# List spools
 curl -s "$API/spools"
+```
 
-# Record 23.5 g used by a print
+### 7. Підключення принтера
+
+Налаштуйте керуюче ПЗ принтера (або скрипт, що запускається після друку) так, щоб після кожного
+завдання він надсилав запит:
+
+```bash
 curl -s -X POST "$API/spools/<id>/subtract-weight" -H 'Content-Type: application/json' \
   -d '{"amount":23.5}'
 ```
 
-### 8. Connect the printer
+Тут `amount` — вага витраченого філаменту в грамах. Більшість слайсерів записує цю оцінку в
+G-код.
 
-Point the printer's host software (or a post-print script or macro on its controller) at
-`POST $API/spools/<id>/subtract-weight`. Send the filament weight used by the finished job, in
-grams, as `amount`. Most slicers write the estimated filament weight into the G-code, so a
-post-print hook can read that value and send it.
+### Оновлення та видалення
 
-### Updating
-
-After changing code, run `pnpm run deploy` again from `backend/infra`. CDK re-bundles only the
-Lambdas whose code changed and updates the stacks in place. To deploy only one stack:
-
-```bash
-pnpm exec cdk deploy PrintMaster-Api-Dev
-```
-
-### Tearing down
-
-```bash
-pnpm run destroy
-```
-
-This removes both stacks, the log groups and the DynamoDB table. In the dev stage, the table is
-created with `RemovalPolicy.DESTROY` and no deletion protection, so **all spool data is deleted**.
-For a production stage, configure the data stack in `infra/bin/app.ts` with
-`RemovalPolicy.RETAIN` and `deletionProtection: true`.
+- Щоб оновити застосунок, знову виконайте `pnpm run deploy` у `backend/infra`.
+- Щоб видалити всі ресурси, виконайте `pnpm run destroy`. У середовищі dev разом зі стеками
+  видаляється і таблиця з усіма даними.
 
 ---
 
-## Development
+## Розробка
 
-Commands run from the relevant package directory. There is no root-level script runner.
+Команди запускаються з директорії відповідного пакета:
 
-| Where                                 | Command                                       | What it does                                   |
-| ------------------------------------- | --------------------------------------------- | ---------------------------------------------- |
-| `packages/*`, `lambdas/*`             | `pnpm test`                                   | Run the vitest suite                           |
-|                                       | `pnpm typecheck` / `pnpm lint` / `pnpm format` | TypeScript, ESLint, Prettier                   |
-| `lambdas/*`                           | `pnpm build` / `pnpm package`                 | Bundle to `dist/index.mjs` / zip to `function.zip` |
-| `infra`                               | `pnpm verify`                                 | Typecheck, infra tests (`node --test`), `cdk synth` |
-|                                       | `pnpm synth` / `pnpm diff`                    | Synthesize templates / diff against AWS        |
+| Де                        | Команда                                        | Що робить                          |
+| ------------------------- | ---------------------------------------------- | ---------------------------------- |
+| `packages/*`, `lambdas/*` | `pnpm test`                                    | Тести (vitest)                     |
+|                           | `pnpm typecheck` / `pnpm lint` / `pnpm format` | Типи, ESLint, Prettier             |
+| `infra`                   | `pnpm verify`                                  | Типи, тести і збірка CDK-шаблонів  |
 
-Domain tests use `InMemoryFilamentSpoolRepository`. The DynamoDB adapter tests mock the AWS SDK
-with `aws-sdk-client-mock`, so the test suites need neither AWS credentials nor a database. To run
-the code against [DynamoDB Local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html),
-set `DYNAMODB_ENDPOINT` (for example `http://localhost:8000`) together with
-`FILAMENT_SPOOLS_TABLE_NAME`.
-
-Conventions:
-
-- ESM everywhere. Relative imports end in `.js`, and ESLint enforces this.
-- Custom errors extend `ApplicationError` and carry a stable `code`.
-- Prettier is configured with `printWidth: 100` and `trailingComma: all`.
+Для тестів не потрібні ні доступ до AWS, ні база даних.
