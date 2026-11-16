@@ -1,0 +1,40 @@
+{
+  "name": "subtract-weight",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=esm --out-extension:.js=.mjs --outdir=dist --sourcemap --external:@aws-sdk/*",
+    "package": "pnpm build && cd dist && zip -r ../function.zip ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@printmaster/filament-management": "workspace:*",
+    "@printmaster/api-utils": "workspace:*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/aws-lambda": "^8.10.164",
+    "@types/node": "^26.6.6",
+    "aws-cdk": "^2.1148.0",
+    "aws-cdk-lib": "^2.276.0",
+    "constructs": "^10.8.1",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.14.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.72.2",
+    "vitest": "^5.1.0"
+  }
+}
